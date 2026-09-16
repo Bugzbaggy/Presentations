@@ -26,8 +26,8 @@ Each has working code behind it:
 | [tsqlt-integration-pipeline](https://github.com/Bugzbaggy/tsqlt-integration-pipeline) | Per-PR integration testing |
 | [mssql-dacpac-cicd](https://github.com/Bugzbaggy/mssql-dacpac-cicd) | Database CI/CD |
 | [mssql-data-api](https://github.com/Bugzbaggy/mssql-data-api) | Governed read-only data API |
-| [sql-valid8](https://github.com/Bugzbaggy/sql-valid8) | Multi-dialect SQL analyzer |
-| [sql-documenter](https://github.com/Bugzbaggy/sql-documenter) | SSDT documentation skill |
+| [nitsql](https://github.com/Bugzbaggy/nitsql) | Multi-dialect SQL analyzer |
+| [schemalore](https://github.com/Bugzbaggy/schemalore) | SSDT documentation skill |
 
 ## Session material
 
