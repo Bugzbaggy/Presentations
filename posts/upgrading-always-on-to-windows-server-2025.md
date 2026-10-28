@@ -10,7 +10,7 @@ We recently ran an in-place operating-system upgrade of a production, two-node *
 
 - Ten databases in the AG. The largest and busiest by far is a high-volume transactional database we'll call `CoreDB`; the rest are settings, reporting, billing, audit, archive, catalog, session and integration databases.
 
-- A file-share witness for quorum, and an in-house PowerShell module (we'll call it **SqlAgOps**) that scripts the drain / suspend / failover / resume choreography and opens a maintenance window in our alerting tool.
+- A file-share witness for quorum, and our PowerShell module, **MssqlHadrOps** (open source: [mssql-hadr-ops](https://github.com/Bugzbaggy/mssql-hadr-ops)), that scripts the drain / suspend / failover / resume choreography and opens a maintenance window in our alerting tool.
 
 ## Why in-place, and how the rolling model works
 
@@ -70,13 +70,14 @@ Your VM's **network and storage drivers** are what let the machine see its NIC a
 
 This applies on every platform — only the component names change:
 
-  PlatformNetwork / storage driversGuest agent
-  **AWS EC2**ENA (network), NVMe (storage)SSM Agent, EC2Launch v2
-  **Azure**Accelerated-networking NIC driver (Mellanox / MANA), StorVSC storageAzure VM Guest Agent (WaAppAgent)
-  **Google Cloud**gVNIC (network), virtio-SCSI / NVMe (storage)Google guest environment (delivered via GooGet)
-  **VMware / on-prem**VMXNET3 (network), PVSCSI (storage)VMware Tools
+| Platform | Network / storage drivers | Guest agent |
+|---|---|---|
+| **AWS EC2** | ENA (network), NVMe (storage) | SSM Agent, EC2Launch v2 |
+| **Azure** | Accelerated-networking NIC driver (Mellanox / MANA), StorVSC storage | Azure VM Guest Agent (WaAppAgent) |
+| **Google Cloud** | gVNIC (network), virtio-SCSI / NVMe (storage) | Google guest environment (delivered via GooGet) |
+| **VMware / on-prem** | VMXNET3 (network), PVSCSI (storage) | VMware Tools |
 
-Because our fleet spans two clouds, the automation **detects the platform at run time and dispatches**: on AWS it version-checks and installs the signed vendor driver and agent packages; on Google Cloud it goes through `GooGet` against the guest-environment repository. The operator runs one cloud-neutral command and never has to know which cloud a given node is on. If you run more than one platform, this is worth building — it keeps a single runbook valid everywhere, instead of one procedure per cloud that drifts apart.
+Because our fleet spans two clouds, the automation **detects the platform at run time and dispatches**: on AWS it version-checks and installs the signed vendor driver and agent packages; on Google Cloud it goes through `GooGet` against the guest-environment repository. The operator runs one cloud-neutral command — `Update-MssqlOpsCloudSystemComponent`, which the patch-prep and install functions call for you — and never has to know which cloud a given node is on. (Only AWS and GCP have updaters: any other host is reported as unmanaged and skipped, and with `-RequireSuccess` — `-RequireCloudComponentUpdate` on the prep and install functions — the gate refuses instead of passing. Without it, a component failure is only a warning.) If you run more than one platform, this is worth building — it keeps a single runbook valid everywhere, instead of one procedure per cloud that drifts apart.
 
 Whatever the platform, the shape is identical: **version-check the installed driver against the current published package, install it while the node is drained, and gate the OS upgrade on success.** Two refinements worth building in: make the check *version-aware* so an already-current node is a no-op and doesn't earn a pointless reboot, and make it *offline-capable* (install from a pre-staged internal copy) so a firewalled production host isn't depending on vendor endpoints mid-window.
 
@@ -92,12 +93,12 @@ We deliberately kept SQL Server on 2022 with no CU change during the OS work. Bu
 
 ### Validate, then fail over
 
-Before draining a node, we validate that a planned, no-data-loss failover is actually possible — witness/quorum healthy, all databases synchronized within thresholds, schema options matched. Our module runs this as a dry run first (note it must run *on the current primary*; run it on a secondary and it correctly refuses):
+Before draining a node, we validate that a planned, no-data-loss failover is actually possible — witness/quorum healthy, the listener's IP able to come online on the target, all databases synchronized within thresholds, schema options matched. Our module runs this as a dry run first (note it must run *on the current primary*; run it on a secondary and it correctly refuses):
 
 ```
-PS C:\> Invoke-AgPlannedFailover        # validate only
+PS C:\> Invoke-MssqlOpsAgPlannedFailover        # validate only
 =========================================================
- SqlAgOps v2.5  |  Mode: VALIDATE
+ MssqlHadrOps v2.6  |  Mode: VALIDATE
  Local node: SQLNODE01
 =========================================================
 
@@ -107,9 +108,11 @@ PS C:\> Invoke-AgPlannedFailover        # validate only
 [2/5] Selecting failover target replica...
  -> PASS: Target replica is 'SQLNODE02'.
 
-[3/5] Verifying WSFC quorum...
+[3/5] Verifying WSFC quorum and listener network...
     WARN: Could not read the quorum witness resource name (cluster object may be
           deserialized); skipped the witness SMB reachability check.
+    ... (per-listener-IP verdict table) ...
+    Listener network OK (IP resources map to a live cluster network, one interface per node, addresses present on the ENI).
  -> PASS: 2 node(s) Up, witness configured, votes 3/3.
 
 [4/5] Comparing per-database DB_CHAINING between replicas...
@@ -134,17 +137,23 @@ CatalogDB     SYNCHRONIZED             60           0
 
 =========================================================
  ALL VALIDATIONS PASSED
+   AG:           ag-prod01
+   Primary:      SQLNODE01
+   Target:       SQLNODE02
 =========================================================
+
 Validation-only run (no -Failover supplied). Returning.
 ```
 
 Then the real thing — a planned, no-data-loss failover that prompts before it moves the primary and opens a maintenance window as it goes:
 
 ```
-PS C:\> Invoke-AgPlannedFailover -Failover
+PS C:\> Invoke-MssqlOpsAgPlannedFailover -Failover
 ...
-[6/8] Opening maintenance window...
+[6/8] Opening PagerDuty maintenance window...
  -> Success: Maintenance window created (ID: ********).
+    Active <start> -> <end> UTC.
+
 [7/8] Issuing planned failover (no data loss) on 'SQLNODE02'...
 
 Name                 PrimaryReplicaServerName
@@ -153,8 +162,11 @@ ag-prod01            SQLNODE02
  -> Success: Failover issued.
 
 [8/8] Waiting 10 seconds for AG state to settle...
-SQLNODE01  Secondary
-SQLNODE02  Primary
+
+Name      Role
+----      ----
+SQLNODE01 Secondary
+SQLNODE02 Primary
 
 =========================================================
  FAILOVER COMPLETE.
@@ -171,20 +183,20 @@ Windows Setup for an in-place upgrade takes a small set of switches — and a fe
 REM Compatibility pre-check only, changes nothing:
 setup.exe /auto Upgrade /compat ScanOnly
 
-REM The upgrade itself (keeps apps + data; EULA is implicit in /auto /quiet):
+REM The upgrade itself (keeps apps + data):
 setup.exe /auto Upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable
 ```
 
-There is no `/eula` or `/migchoice` switch — drop them. If you'd rather watch it, run `setup.exe` interactively and choose "Keep personal files and apps." `/dynamicupdate Disable` keeps Setup from pulling extra content mid-run, which makes the run predictable and offline-safe. Setup returns to the prompt immediately and reboots the node several times; the node stays a **paused** cluster member throughout — do not evict it.
+There is no `/migchoice` switch — drop it. Microsoft does document `/eula accept` for Windows 11-era Setup, where `/auto` no longer accepts the license on its own: if a `/quiet` run stops with `MOSETUP_E_EULA_ACCEPT_REQUIRED` (0xC190010E), add `/eula accept`. If you'd rather watch it, run `setup.exe` interactively and choose "Keep personal files and apps." `/dynamicupdate Disable` keeps Setup from pulling extra content mid-run, which makes the run predictable and offline-safe. Setup returns to the prompt immediately and reboots the node several times; the node stays a **paused** cluster member throughout — do not evict it.
 
 ### Resume and let it catch up
 
 After the node returns on WS2025, resume cluster membership and AG data movement. Expect the busy databases to come back `SYNCHRONIZING` (catching up) before they reach `SYNCHRONIZED`:
 
 ```
-PS C:\> Resume-AgSecondaryPatching
+PS C:\> Resume-MssqlOpsAgSecondaryPatching
 =========================================================
- SqlAgOps v2.1
+ MssqlHadrOps v2.1
  Starting Post-Update Resume for Secondary Node: SQLNODE01
 =========================================================
 
@@ -220,13 +232,13 @@ The first production run of our automation drained the secondary's cluster node 
 
 What made it easy to miss in review: both steps were in the script, both "worked," and the node came back healthy. Only the *order* was wrong, and the damage landed on a different node than the one under maintenance — so it looked like an unrelated blip.
 
-**Fix:** reverse it — **suspend data movement first**, then move the core cluster group, then drain. (Full sequence and the `required_synchronized_secondaries_to_commit` precondition are in the ordering section above.) We fixed it in the tooling rather than the runbook: the suspend is now unconditionally the first step of the prep function, so no one can reorder it by editing a document. Sequencing you actually depend on belongs in code, not in a numbered list a human follows at 2am.
+**Fix:** reverse it — **suspend data movement first**, then move the core cluster group, then drain. (Full sequence and the `required_synchronized_secondaries_to_commit` precondition are in the ordering section above.) We fixed it in the tooling rather than the runbook: in the prep function (`Initialize-MssqlOpsAgSecondaryPatching`) the suspend now always runs before the core-group move and the drain, so no one can reorder it by editing a document. Sequencing you actually depend on belongs in code, not in a numbered list a human follows at 2am.
 
 ### 2. The OS cumulative update quietly didn't install
 
 Our combined "patch + drivers" step refreshed the cloud drivers first, which set a *pending reboot*, and the subsequent "install Windows Update and auto-reboot" call then rebooted for that pending state — sometimes **before the 26 GB OS CU was applied**. On top of that, the update call used the box's default service, which (after we'd removed the Microsoft Update opt-in) had nothing to install. Net result: drivers updated, machine rebooted, OS CU never landed — and the version number looked almost right, so it was easy to miss.
 
-**Fix:** reorder to *install the OS update first* (pinned to the Windows Update channel, with reboot suppressed), *then* refresh drivers, *then* reboot exactly once. Verify with the receipt, not the eyeball: `Get-HotFix -Id KB5122882` and the build revision (`UBR`), and re-scan Windows Update to confirm the CU is no longer offered.
+**Fix:** reorder to *install the OS update first* (pinned to the Windows Update channel, with reboot suppressed), *then* refresh drivers, *then* reboot exactly once — which is what `Install-MssqlOpsAgSecondaryPatch -Mode Windows` now does. Verify with the receipt, not the eyeball: `Get-HotFix -Id KB5122882` and the build revision (`UBR`), and re-scan Windows Update to confirm the CU is no longer offered.
 
 ### 3. SQL Server didn't auto-start after the WS2025 upgrade
 
@@ -244,7 +256,7 @@ Get-DbaNetworkConfiguration -SqlInstance SQLNODE01   # TCP/IP enabled, port 1433
 
 This was the ugly one. A weekly statistics job was **mid-run** on `CoreDB` when we failed over. Its in-flight write transaction became a blocker for the AG state change: the AG repeatedly killed it (you'll see `ABORT_AFTER_WAIT = BLOCKERS` in the log) and looped on a rollback stuck at 0%, so four of the busiest databases sat in **NOT SYNCHRONIZING** on the new secondary while the primary served happily. No data loss — but no redundancy on those four, either.
 
-**Fix:** quiesce heavy jobs on the AG databases *before* any failover. A guard step at the start of a job only checks "am I primary?" at launch — it does nothing if a failover happens *during* the run. We added a pre-flight gate to our tooling that aborts the maintenance if it finds a `KILLED/ROLLBACK` session, a sustained block, or a long-running *write* transaction on the node — and prints the offending session and job so you can stop it first. If you're caught out mid-incident, the recovery is to stop/disable the owning job (once the node is a secondary its own guard then holds it off) and let the databases re-join.
+**Fix:** quiesce heavy jobs on the AG databases *before* any failover. A guard step at the start of a job only checks "am I primary?" at launch — it does nothing if a failover happens *during* the run. We added a pre-flight gate to the patch-prep step of our tooling (`Initialize-MssqlOpsAgSecondaryPatching`; the planned-failover command does not run it, so check by hand before a failover) that aborts the maintenance if it finds a `KILLED/ROLLBACK` session, a sustained block, or a long-running *write* transaction on the node — and prints each offending session with its login and program name, so you can find and stop the owning job first. If you're caught out mid-incident, the recovery is to stop/disable the owning job (once the node is a secondary its own guard then holds it off) and let the databases re-join.
 
 ### 5. Watch the SQL build across replicas — direction matters
 
@@ -269,15 +281,15 @@ Cause: two SQL toolsets (dbatools and the `SqlServer` module) both ship `Microso
 
 Our tooling reads a maintenance-window API token from a DPAPI-protected SecretStore vault. On these nodes the vault had been configured with a master password nobody had, and reconfiguring it for unattended use demanded that password. The recovery is a reset — and the trap is that a session which has already loaded the vault caches the old config, so an in-session reset silently fails.
 
-**Fix:** reset from a **brand-new** session that hasn't touched the vault — wipe the local store files, confirm the folder is empty, then re-run your token setup so it initializes fresh with no password.
+**Fix:** reset from a **brand-new** session that hasn't touched the vault — wipe the local store files, confirm the folder is empty, then re-run your token setup (`Set-MssqlOpsPagerDutyUserApiToken`) so it initializes fresh with no password.
 
 ### 8. Maintenance-window API calls are best-effort, not blocking
 
 Small thing, but worth designing for: our close-the-window call came back `400 Bad Request` and the resume script (correctly) treated it as non-blocking and carried on:
 
 ```
-[5/5] Closing maintenance window...
- -> WARNING: Failed to close maintenance window (non-blocking): 400 (Bad Request).
+[5/5] Closing PagerDuty maintenance window for SQLNODE01...
+ -> WARNING: Failed to close PagerDuty maintenance window (non-blocking): Response status code does not indicate success: 400 (Bad Request).
 ```
 
 Never let a cosmetic alerting-API failure abort a database maintenance step. Log it and move on.

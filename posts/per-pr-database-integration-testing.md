@@ -15,8 +15,8 @@ step that can block a correct change for the wrong reason.
 1. The branch's DB projects compile to DACPACs
 2. A fresh, disposable SQL Server 2022 container starts
 3. The schema is published into it and integrity-checked   ← the gate
-4. Auto-generated tests run for each changed object        ← report-only
-5. Curated hand-written tests run                          ← report-only
+4. Curated hand-written tests run                          ← report-only
+5. Auto-generated tests run for each changed object        ← report-only
 6. A ready-to-finish test starter is generated per object
 7. A plain-English summary comment is posted on the PR
 ```
@@ -26,7 +26,9 @@ there is no drifting "test database" that slowly stops resembling production.
 
 ## The one decision that made it survivable
 
-**Only step 3 can block the PR.**
+**Only step 3 can block the PR** (unless you plug an external E2E suite into the
+pipeline's optional `E2E_TEST_COMMAND` parameter, which runs without the
+report-only wrapper, so a failing suite fails the build).
 
 That was not the original instinct. The instinct is that if you've gone to the
 trouble of generating tests, failures should block — otherwise what's the
@@ -51,10 +53,12 @@ else is information for the reviewer.
 | Code exercised by those tests | Line coverage of changed procedures | No |
 | Interface contract | Changed procs still take the same params, return the same columns | No — Tier 1 |
 | Behaviour | Changed deterministic functions still return the same output | No — Tier 2 |
+| Hand-written regression tests (repo-wide suite) | The curated `tests/curated/` tSQLt suite — the whole repo's, not tests written for this PR | No |
 
 Tier 1 and Tier 2 are the rows reviewers actually read. A contract change
-shows up as a diff in the comment, which is far easier to notice than in a
-600-line `.sql` file.
+shows up as a flagged row in the comment (and, once the baseline is
+regenerated, as a small reviewable diff), which is far easier to notice than
+in a 600-line `.sql` file.
 
 ## The blocker nobody warns you about: encrypted config
 
@@ -92,7 +96,7 @@ denylist **and** has cardinality ≤ 50.
 
 That second condition does most of the work: a status column has eight
 distinct values, a message-body column has millions. But cardinality alone
-isn't enough — a low-cardinality `Country` or `Gender` column is still PII —
+isn't enough — a low-cardinality `Gender` or `Nationality` column is still PII —
 so the name denylist covers bodies, identifiers, tokens, contact details,
 financial fields, and demographics.
 

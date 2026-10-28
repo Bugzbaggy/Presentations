@@ -22,39 +22,33 @@ The server is a TypeScript MCP server (Node) that exposes the fleet to an AI cli
 
 A few numbers to set the scale:
 
-- **~50 diagnostic tools** — blocking chains, wait stats, missing/unused indexes, index fragmentation, Query Store regressions, top queries, plan-cache pollution, tempdb, latches, AG health (including cross-region distributed AGs), backup status, Agent jobs, CPU/memory history, buffer pool by object, file I/O, loaded modules, a crash-dump reader, the error log, and an on-demand cluster-log generator.
+- **55 tools in the default DBA profile**, most of them diagnostics — blocking chains, wait stats, missing/unused indexes, index fragmentation, Query Store regressions, top queries, plan-cache pollution, tempdb, latches, AG health (including cross-region distributed AGs), backup status, Agent jobs, CPU/memory history, buffer pool by object, file I/O, host DLL versions, a crash-dump reader, the error log, and an on-demand cluster-log generator.
 
 - **A whole-fleet reach** — a dozen instances across four regions, each addressable by name, plus a synthetic `<region>-primary` alias that resolves to whichever node is the current Availability Group primary at query time (so a failover never leaves you pointed at a stale server).
 
-- **A 40+ check health report** built on the `dbatools` PowerShell module — availability, performance, recoverability, reliability, security, configuration, maintenance, and host/OS — that also runs headless on a schedule and posts a weekly summary.
+- **A 60+ check health report** built on the `dbatools` PowerShell module — availability, performance, recoverability, reliability, security, configuration, and host/OS — that also runs headless on a schedule and posts a weekly summary.
 
 - **An offline schema knowledge layer** so the AI knows what a column *means* and how coded values decode, instead of guessing.
 
-- **222 automated checks** that validate the tool sets and every read-only guardrail on every build.
+- **330+ automated tests** that validate the tool sets and every read-only guardrail on every build.
 
 ## Why It's Safe: Read-Only at Three Independent Layers
 
 This is the part I care about most, so let me be specific. "Read-only" here isn't a promise — it's enforced at three layers that a write would have to defeat *all* of, simultaneously.
 
-Layer
-What it enforces
-
-**1. The login**
-Every operation runs under the *caller's own* least-privilege SQL login. There is no shared service account. SQL Server enforces that person's permissions and audits every query back to them.
-
-**2. The connection**
-`ApplicationIntent=ReadOnly` with `Encrypt=True`. The connection itself declares it's there to read, and routes to readable secondaries where possible.
-
-**3. The query allowlist**
-Server-side, before anything touches the database: only `SELECT` / `WITH` / `DECLARE` T-SQL and only `Get-`/`Test-`/`Measure-`/`Find-` `dbatools` cmdlets are accepted. DML, DDL, DCL, `EXEC`, `BACKUP`, `RESTORE`, `DBCC`, `KILL`, `WAITFOR`, dynamic SQL, and batch-smuggling (`SELECT 1; DROP TABLE x`) are all rejected.
+| Layer | What it enforces |
+|---|---|
+| **1. The login** | Interactive use runs under the *caller's own* least-privilege SQL login, so SQL Server enforces that person's permissions and audits every query back to them. Unattended health checks use a dedicated least-privilege diagnostics login (the repo ships its grant script). |
+| **2. The connection** | `ApplicationIntent=ReadOnly` with `Encrypt=True`. The connection itself declares it's there to read, and routes to readable secondaries where possible. |
+| **3. The query allowlist** | Server-side, before anything touches the database: only `SELECT` / `WITH` / `DECLARE` T-SQL and only `Get-`/`Test-`/`Measure-`/`Find-` `dbatools` cmdlets (plus the read-only `Invoke-DbaDiagnosticQuery`) are accepted. DML, DDL, DCL, `EXEC`, `BACKUP`, `RESTORE`, `DBCC`, `KILL`, `WAITFOR`, dynamic SQL, and batch-smuggling (`SELECT 1; DROP TABLE x`) are all rejected. |
 
 On top of those three, a few things I learned to add the hard way:
 
-- **No secret ever lives on disk — and it's *enforced*.** The server refuses to start if it finds a plaintext password in its config. The real credential comes only from the OS credential store (Windows Credential Manager / macOS Keychain / libsecret) or a genuine environment variable, resolved at startup. A password sitting in a config file is a startup error, not a warning.
+- **No secret ever lives on disk — and it's *enforced*.** The server refuses to start if it finds a plaintext password in its config. The real credential comes only from the OS credential store (Windows Credential Manager / macOS Keychain / libsecret) or a genuine environment variable, read when it's first needed. A password sitting in a config file is a startup error, not a warning.
 
-- **A sensitive-table guardrail.** The fleet has a message-log table with billions of rows and PII in it. An unbounded scan of it — the kind an eager AI might try for a "how many messages today" question — is blocked at the query layer and redirected to the pre-aggregated reporting tables. You physically cannot ask the tool to table-scan the crown jewels.
+- **A sensitive-table guardrail.** The fleet has a message-log table with billions of rows and PII in it. An unbounded scan of it (no `WHERE`, `TOP` or `OFFSET`) — the kind an eager AI might try for a "how many messages today" question — is blocked at the query layer and redirected to the pre-aggregated reporting tables. Table-scanning the crown jewels takes an explicit opt-in (`allow_large_scan:true`); it can't happen by accident.
 
-- **Even the one write path is a dry run by default.** There's an opt-in profile for engineers that adds a single `execute_write` tool — and it is *dry-run by default* (the change is executed, the row count reported, then rolled back). It commits only when a human re-runs it with `confirm:true`, it's bounded by the engineer's own SQL role, and it still hard-blocks DDL, settings changes, principals, backups, and Agent jobs. The default read profiles don't have it at all.
+- **Even the one write path is a dry run by default.** There's an opt-in profile for engineers (`TOOLSET=eng-write`, which stays read-only until a separate `ENG_WRITE_ENABLED=1` kill-switch is also set) that adds a single `execute_write` tool — and it is *dry-run by default* (the change is executed, the row count reported, then rolled back). It commits only when re-called with `confirm:true`, which the server's own instructions tell the AI never to do without a human's explicit go-ahead; it's bounded by the engineer's own SQL role, and it still hard-blocks DDL, settings changes, principals, backups, and Agent jobs. The default read profiles don't have it at all.
 
 The payoff of this design is organizational, not just technical: I can give the ops team and engineers their own profiles, each scoped to their own login, and let them ask production questions in plain English — without handing anyone a foot-gun. The safety isn't a rule people have to remember. It's the shape of the tool.
 
@@ -82,7 +76,7 @@ A few others earn their place:
 
 - **A semantic layer.** An offline, bundled corpus of schema documentation — table meanings, column purposes, and enum decodings — so when the AI sees `StatusId = 3` it knows that means "Rejected," instead of guessing.
 
-And a lot of that depth isn't hand-rolled — it's **`dbatools`** under the hood. The brilliant open-source PowerShell module is the engine behind the entire 40+ check health sweep and the host/OS-level checks (power plan, firewall, disk, machine spec) that raw T-SQL can't reach. The server exposes *only* its read-only cmdlets (`Get-`/`Test-`/`Measure-`/`Find-Dba*`), so I got years of battle-tested DBA tooling as an AI-callable surface without writing a fraction of it myself. dbatools does the heavy lifting; the MCP server just makes it safe and conversational.
+And a lot of that depth isn't hand-rolled — it's **`dbatools`** under the hood. The brilliant open-source PowerShell module is the engine behind the entire 60+ check health sweep and the host/OS-level checks (power plan, firewall, disk, machine spec) that raw T-SQL can't reach. The server exposes *only* its read-only cmdlets (`Get-`/`Test-`/`Measure-`/`Find-Dba*`, plus `Invoke-DbaDiagnosticQuery`), so I got years of battle-tested DBA tooling as an AI-callable surface without writing a fraction of it myself. dbatools does the heavy lifting; the MCP server just makes it safe and conversational.
 
 ## Why It's Useful: Four Investigations It Actually Cracked
 
@@ -90,7 +84,7 @@ Power is nothing without judgment. What makes this tool genuinely useful is that
 
 ### 1. The third-party driver that crashed the engine — and the "upgrade" that was already done
 
-One morning a region's primary node hard-crashed with a fatal fail-fast exception, crash-looped three times in thirty seconds, and triggered an automatic Availability Group failover — a two-minute outage that spiked to tens of thousands of call failures per minute. The Windows event log named the faulting module: a **third-party the cloud data warehouse ODBC driver** running *in-process* inside SQL Server (it has to, for the linked servers to work), so when the driver faulted, it took the whole engine down with it.
+One morning a region's primary node hard-crashed with a fatal fail-fast exception, crash-looped three times in thirty seconds, and triggered an automatic Availability Group failover — a two-minute outage that spiked to tens of thousands of call failures per minute. The Windows event log named the faulting module: a **third-party data-warehouse ODBC driver** running *in-process* inside SQL Server (it has to, for the linked servers to work), so when the driver faulted, it took the whole engine down with it.
 
 The obvious fix — "upgrade the driver" — was where the AI + MCP earned its keep. We kept upgrading, restarting, repairing the install, and every check came back "no change." Here's why: the newest build was *already on disk* on every node, and had been for weeks. The crash happened only because the crashed node's *process* was still running an old build it had loaded into memory long ago and never restarted to release. Proof came from one query, fanned out:
 
@@ -99,7 +93,7 @@ The obvious fix — "upgrade the driver" — was where the AI + MCP earned its k
 -- vs. what's sitting on disk? These can differ for weeks.
 SELECT name, file_version   -- the mapped, in-memory build
 FROM sys.dm_os_loaded_modules
-WHERE name LIKE '%the cloud data warehouse%';
+WHERE name LIKE '%<driver module>%';   -- placeholder: the driver's DLL file name
 ```
 
 The healthy nodes showed the new version loaded and running clean; the crashed one had the old build mapped. So the fix was never "install the driver" — it was a plain SQL Server restart on each node still running a stale in-memory build, so it would reload the version already on disk. Without the ability to read the *loaded* module (not the disk file), we'd have kept reinstalling something that was already there.
@@ -134,7 +128,7 @@ If it can't fill in the first two, it labels the suggestion "hygiene," not a fix
 
 ## Where This Goes Next: An MCP-Powered PR Reviewer and Impact Analyzer
 
-Here's the direction I'm most excited about, and where this connects to [the AI migration-script generator I wrote about previously](#). That pipeline turns a schema change into a deployment-ready migration script automatically. But it reasons about the *code* — the repo. It can't see what a change will do to *live production*. The read-only MCP can. Put the two together and the pull request stops being a code review and becomes an **impact analysis grounded in the real database.**
+Here's the direction I'm most excited about, and where this connects to an AI migration-script generator — the pull-request workflow in [mssql-dacpac-cicd](https://github.com/Bugzbaggy/mssql-dacpac-cicd). That pipeline turns a schema change into a deployment-ready migration script automatically. But it reasons about the *code* — the repo. It can't see what a change will do to *live production*. The read-only MCP can. Put the two together and the pull request stops being a code review and becomes an **impact analysis grounded in the real database.**
 
 Concretely, when an engineer opens a PR that changes the schema, an agent with the read-only MCP can post a comment that answers questions the diff alone never could:
 
@@ -152,17 +146,16 @@ Every one of those checks is read-only. None of them can touch the database. But
 
 ## The Tech Stack
 
-Component
-Technology
-
-ServerTypeScript on Node (Model Context Protocol server)
-Transportsstdio (per-user local launch) and HTTP (shared service)
-DatabasesSQL Server 2022, multi-region Availability Groups (incl. distributed AGs)
-Health checkPowerShell + `dbatools` (read-only cmdlets only)
-SecretsOS credential store or env var — never on disk (enforced at startup)
-AI clientsClaude Code, Claude Desktop, VS Code + Copilot, Cursor
-Quality bar222 automated checks (Node + PowerShell) over tools, guardrails, and topology
-Built withClaude Code (the server, the health check, and the runbooks)
+| Component | Technology |
+|---|---|
+| Server | TypeScript on Node (Model Context Protocol server) |
+| Transports | stdio (per-user local launch) and HTTP (shared service) |
+| Databases | SQL Server 2022, multi-region Availability Groups (incl. distributed AGs) |
+| Health check | PowerShell + `dbatools` (read-only cmdlets plus fixed diagnostic queries) |
+| Secrets | OS credential store or env var — never on disk (enforced at startup) |
+| AI clients | Claude Code, Claude Desktop, VS Code + Copilot, Cursor |
+| Quality bar | 330+ automated tests (Node's built-in test runner; some execute the generated PowerShell) over tools, guardrails, and topology |
+| Built with | Claude Code (the server, the health check, and the runbooks) |
 
 ## What I Learned
 
@@ -180,7 +173,7 @@ The driver-crash investigation taught me a lesson I now apply everywhere: for an
 
 ### Make the AI show its evidence
 
-The most valuable thing I encoded wasn't a query — it was the discipline: find a healthy control, demand a mechanism, distinguish co-occurrence from cause, and label a guess as a guess. An AI that can run 50 diagnostics is impressive. An AI that runs the *right three* and tells you why is useful.
+The most valuable thing I encoded wasn't a query — it was the discipline: find a healthy control, demand a mechanism, distinguish co-occurrence from cause, and label a guess as a guess. An AI that can run dozens of diagnostics is impressive. An AI that runs the *right three* and tells you why is useful.
 
 ## Closing
 
@@ -188,6 +181,6 @@ The gap between "AI that could help with your database" and "AI you'd actually l
 
 It started as a way to stop investigating cold. It's turned into the most-used, least-scary tool I own — and, next, an automated reviewer that reads production so my pull requests don't have to guess.
 
-*The tool described here is a read-only MCP server for a multi-region SQL Server 2022 fleet, built with Claude Code, validated by 222 automated checks, and used daily for incident response, health reporting, and — increasingly — live impact analysis on pull requests. If you're building something similar, or wondering how to give AI safe access to production data, feel free to reach out.*
+*The tool described here is a read-only MCP server for a multi-region SQL Server 2022 fleet, built with Claude Code, validated by 330+ automated tests, and used daily for incident response, health reporting, and — increasingly — live impact analysis on pull requests. If you're building something similar, or wondering how to give AI safe access to production data, feel free to reach out.*
 
 **— Anonymous**

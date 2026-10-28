@@ -19,7 +19,7 @@ and failures are exactly as they happened.
 
 Each has working code behind it:
 
-| Project | Related post |
+| Project | Related post / purpose |
 |---|---|
 | [mssql-hadr-ops](https://github.com/Bugzbaggy/mssql-hadr-ops) | The WS2025 rolling upgrade |
 | [mssql-dba-mcp](https://github.com/Bugzbaggy/mssql-dba-mcp) | The read-only SQL MCP |
@@ -31,7 +31,10 @@ Each has working code behind it:
 
 ## Session material
 
-Slide decks and demo code from conference and user-group sessions:
+Slide decks and demo code from conference and user-group sessions by
+[sqlworldwide](https://github.com/sqlworldwide) (Taiob Ali), carried over from
+[sqlworldwide/Presentations](https://github.com/sqlworldwide/Presentations),
+which this repository is forked from. The written field notes above are mine.
 
 - Analyzing Azure Monitor Log Data for Azure SQL Database
 - Azure SQL Database — Where is my SQL Agent
